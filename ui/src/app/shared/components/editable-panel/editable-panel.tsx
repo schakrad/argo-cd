@@ -7,7 +7,8 @@ import {Consumer} from '../../context';
 import {Spinner} from '../spinner';
 
 export interface EditablePanelItem {
-    title: string;
+    title?: string;
+    customTitle?: string | React.ReactNode;
     key?: string;
     before?: React.ReactNode;
     view: string | React.ReactNode;
@@ -51,6 +52,7 @@ export class EditablePanel<T = {}> extends React.Component<EditablePanelProps<T>
     }
 
     public render() {
+        console.log('this.props.defaultValues', this.props.values);
         return (
             <Consumer>
                 {ctx => (
@@ -99,7 +101,7 @@ export class EditablePanel<T = {}> extends React.Component<EditablePanelProps<T>
                                             <React.Fragment key={item.key || item.title}>
                                                 {item.before}
                                                 <div className='row white-box__details-row'>
-                                                    <div className='columns small-3'>{item.title}</div>
+                                                    <div className='columns small-3'>{item.customTitle || item.title}</div>
                                                     <div className='columns small-9'>{item.view}</div>
                                                 </div>
                                             </React.Fragment>
@@ -137,7 +139,7 @@ export class EditablePanel<T = {}> extends React.Component<EditablePanelProps<T>
                                                 <React.Fragment key={item.key || item.title}>
                                                     {item.before}
                                                     <div className='row white-box__details-row'>
-                                                        <div className='columns small-3'>{(item.titleEdit && item.titleEdit(api)) || item.title}</div>
+                                                        <div className='columns small-3'>{(item.titleEdit && item.titleEdit(api)) || item.customTitle || item.title}</div>
                                                         <div className='columns small-9'>{(item.edit && item.edit(api)) || item.view}</div>
                                                     </div>
                                                 </React.Fragment>
