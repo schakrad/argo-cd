@@ -10,10 +10,26 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
+
+	"github.com/argoproj/gitops-engine/pkg/health"
+	"github.com/argoproj/gitops-engine/pkg/sync/common"
+	"github.com/argoproj/gitops-engine/pkg/sync/hook"
+	"github.com/argoproj/gitops-engine/pkg/sync/ignore"
+	"github.com/argoproj/gitops-engine/pkg/utils/kube"
+	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
+	"github.com/mattn/go-isatty"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/pointer"
+	"sigs.k8s.io/yaml"
 
 	"github.com/argoproj/argo-cd/v2/cmd/argocd/commands/headless"
 	cmdutil "github.com/argoproj/argo-cd/v2/cmd/util"
@@ -36,22 +52,6 @@ import (
 	argoio "github.com/argoproj/argo-cd/v2/util/io"
 	"github.com/argoproj/argo-cd/v2/util/manifeststream"
 	"github.com/argoproj/argo-cd/v2/util/text/label"
-	"github.com/argoproj/gitops-engine/pkg/health"
-	"github.com/argoproj/gitops-engine/pkg/sync/common"
-	"github.com/argoproj/gitops-engine/pkg/sync/hook"
-	"github.com/argoproj/gitops-engine/pkg/sync/ignore"
-	"github.com/argoproj/gitops-engine/pkg/utils/kube"
-	grpc_retry "github.com/grpc-ecosystem/go-grpc-middleware/retry"
-	"github.com/mattn/go-isatty"
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/utils/pointer"
-	"sigs.k8s.io/yaml"
 )
 
 // NewApplicationCommand returns a new instance of an `argocd app` command
@@ -96,11 +96,50 @@ func NewApplicationCommand(clientOpts *argocdclient.ClientOptions) *cobra.Comman
 }
 
 type watchOpts struct {
-	sync      bool
-	health    bool
+	// sync determines whether to wait for the app to become Synced.
+	sync bool
+	// health determines whether to wait for the app to become Healthy.
+	health bool
+	// operation determines whether to wait for the current operation to finish.
 	operation bool
+	// suspended determines whether to wait for the app to go into a suspended state.
 	suspended bool
-	degraded  bool
+	// degraded determines whether to wait for the app to become Degraded.
+	degraded bool
+}
+
+// Description describes in plain terms what we are waiting on.
+func (o *watchOpts) Description() string {
+	var conditions []string
+	if o.sync {
+		conditions = append(conditions, "the app to become Synced")
+	}
+	if o.health {
+		conditions = append(conditions, "the app to become Healthy")
+	}
+	if o.operation {
+		conditions = append(conditions, "the current operation to finish")
+	}
+	if o.suspended {
+		conditions = append(conditions, "the app to become Suspended")
+	}
+	if o.degraded {
+		conditions = append(conditions, "the app to become Degraded")
+	}
+
+	if len(conditions) == 0 {
+		return "No wait conditions set."
+	}
+
+	if len(conditions) == 1 {
+		return fmt.Sprintf("Waiting for %s...", conditions[0])
+	}
+
+	if len(conditions) == 2 {
+		return fmt.Sprintf("Waiting for %s and %s...", conditions[0], conditions[1])
+	}
+
+	return fmt.Sprintf("Waiting for %s and %s...", strings.Join(conditions[:len(conditions)-1], ", "), conditions[len(conditions)-1])
 }
 
 // NewApplicationCreateCommand returns a new instance of an `argocd app create` command
@@ -260,11 +299,11 @@ func hasAppChanged(appReq, appRes *argoappv1.Application, upsert bool) bool {
 	return true
 }
 
-func parentChildDetails(appIf application.ApplicationServiceClient, ctx context.Context, appName string, appNs string) (map[string]argoappv1.ResourceNode, map[string][]string, map[string]struct{}) {
+func parentChildDetails(appIf application.ApplicationServiceClient, ctx context.Context, appName string, appNs string) (map[string]argoappv1.ResourceNode, map[string][]string, []string) {
 
 	mapUidToNode := make(map[string]argoappv1.ResourceNode)
 	mapParentToChild := make(map[string][]string)
-	parentNode := make(map[string]struct{})
+	topLevelUids := make([]string, 0)
 
 	resourceTree, err := appIf.ResourceTree(ctx, &application.ResourcesQuery{Name: &appName, AppNamespace: &appNs, ApplicationName: &appName})
 	errors.CheckError(err)
@@ -280,10 +319,10 @@ func parentChildDetails(appIf application.ApplicationServiceClient, ctx context.
 			}
 			mapParentToChild[node.ParentRefs[0].UID] = append(mapParentToChild[node.ParentRefs[0].UID], node.UID)
 		} else {
-			parentNode[node.UID] = struct{}{}
+			topLevelUids = append(topLevelUids, node.UID)
 		}
 	}
-	return mapUidToNode, mapParentToChild, parentNode
+	return mapUidToNode, mapParentToChild, topLevelUids
 }
 
 func printHeader(acdClient argocdclient.Client, app *argoappv1.Application, ctx context.Context, windows *argoappv1.SyncWindows, showOperation bool, showParams bool) {
@@ -359,17 +398,17 @@ func NewApplicationGetCommand(clientOpts *argocdclient.ClientOptions) *cobra.Com
 				}
 			case "tree":
 				printHeader(acdClient, app, ctx, windows, showOperation, showParams)
-				mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState := resourceParentChild(ctx, acdClient, appName, appNs)
+				mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState := resourceParentChild(ctx, acdClient, appName, appNs)
 				if len(mapUidToNode) > 0 {
 					fmt.Println()
-					printTreeView(mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState)
+					printTreeView(mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState)
 				}
 			case "tree=detailed":
 				printHeader(acdClient, app, ctx, windows, showOperation, showParams)
-				mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState := resourceParentChild(ctx, acdClient, appName, appNs)
+				mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState := resourceParentChild(ctx, acdClient, appName, appNs)
 				if len(mapUidToNode) > 0 {
 					fmt.Println()
-					printTreeViewDetailed(mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState)
+					printTreeViewDetailed(mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState)
 				}
 			default:
 				errors.CheckError(fmt.Errorf("unknown output format: %s", output))
@@ -1495,7 +1534,6 @@ func NewApplicationWaitCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 		timeout   uint
 		selector  string
 		output    string
-		watchFlag bool
 		resources []string
 	)
 	var command = &cobra.Command{
@@ -1544,8 +1582,8 @@ func NewApplicationWaitCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 					appNames = append(appNames, i.Name)
 				}
 			}
-			for _, appName := range appNames {
-				_, _, err := waitOnApplicationStatus(ctx, acdClient, appName, timeout, watch, selectedResources, output, watchFlag)
+			for i, appName := range appNames {
+				_, _, err := waitOnApplicationStatus(ctx, acdClient, appName, timeout, watch, selectedResources, output, len(appNames), i)
 				errors.CheckError(err)
 			}
 		},
@@ -1554,11 +1592,10 @@ func NewApplicationWaitCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 	command.Flags().BoolVar(&watch.health, "health", false, "Wait for health")
 	command.Flags().BoolVar(&watch.suspended, "suspended", false, "Wait for suspended")
 	command.Flags().BoolVar(&watch.degraded, "degraded", false, "Wait for degraded")
-	command.Flags().StringVarP(&selector, "selector", "l", "", "Wait for apps by label. Supports '=', '==', '!=', in, notin, exists & not exists. Matching apps must satisfy all of the specified label constraints.")
-	command.Flags().StringArrayVar(&resources, "resource", []string{}, fmt.Sprintf("Sync only specific resources as GROUP%[1]sKIND%[1]sNAME or %[2]sGROUP%[1]sKIND%[1]sNAME. Fields may be blank and '*' can be used. This option may be specified repeatedly", resourceFieldDelimiter, resourceExcludeIndicator))
+	command.Flags().StringVarP(&selector, "selector", "l", "", "Wait for apps by label. Supports '=', '==', '!=', in, notin, exists & not exists. Matching apps must satisfy all of the specified label constraints. Any apps specified by name as arguments will also be included.")
+	command.Flags().StringArrayVar(&resources, "resource", []string{}, fmt.Sprintf("Wait for only specific resources as GROUP%[1]sKIND%[1]sNAME or %[2]sGROUP%[1]sKIND%[1]sNAME. Fields may be blank and '*' can be used. This option may be specified repeatedly", resourceFieldDelimiter, resourceExcludeIndicator))
 	command.Flags().BoolVar(&watch.operation, "operation", false, "Wait for pending operations")
 	command.Flags().StringVarP(&output, "output", "o", "wide", "Output format. One of: json|yaml|wide|tree|tree=detailed")
-	command.Flags().BoolVar(&watchFlag, "watchFlag", false, "watchFlag provides the dynamic view of status of appResources")
 	command.Flags().UintVar(&timeout, "timeout", defaultCheckTimeoutSeconds, "Time out after this many seconds")
 	return command
 }
@@ -1571,19 +1608,21 @@ func printAppResources(w io.Writer, app *argoappv1.Application) {
 	}
 }
 
-func printTreeView(nodeMapping map[string]argoappv1.ResourceNode, parentChildMapping map[string][]string, parentNodes map[string]struct{}, mapNodeNameToResourceState map[string]*resourceState) {
+func printTreeView(nodeMapping map[string]argoappv1.ResourceNode, parentChildMapping map[string][]string, topLevelUids []string, mapNodeNameToResourceState map[string]*resourceState) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintf(w, "KIND/NAME\tSTATUS\tHEALTH\tMESSAGE\n")
-	for uid := range parentNodes {
+	sortedNodes := sortNodes(topLevelUids, nodeMapping)
+	for _, uid := range sortedNodes {
 		treeViewAppGet("", nodeMapping, parentChildMapping, nodeMapping[uid], mapNodeNameToResourceState, w)
 	}
 	_ = w.Flush()
 }
 
-func printTreeViewDetailed(nodeMapping map[string]argoappv1.ResourceNode, parentChildMapping map[string][]string, parentNodes map[string]struct{}, mapNodeNameToResourceState map[string]*resourceState) {
+func printTreeViewDetailed(nodeMapping map[string]argoappv1.ResourceNode, parentChildMapping map[string][]string, topLevelUids []string, mapNodeNameToResourceState map[string]*resourceState) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintf(w, "KIND/NAME\tSTATUS\tHEALTH\tAGE\tMESSAGE\tREASON\n")
-	for uid := range parentNodes {
+	sortedNodes := sortNodes(topLevelUids, nodeMapping)
+	for _, uid := range sortedNodes {
 		detailedTreeViewAppGet("", nodeMapping, parentChildMapping, nodeMapping[uid], mapNodeNameToResourceState, w)
 	}
 	_ = w.Flush()
@@ -1680,7 +1719,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 				}
 			}
 
-			for _, appQualifiedName := range appNames {
+			for i, appQualifiedName := range appNames {
 				appName, appNs := argo.ParseFromQualifiedName(appQualifiedName, "")
 
 				if len(selectedLabels) > 0 {
@@ -1856,7 +1895,7 @@ func NewApplicationSyncCommand(clientOpts *argocdclient.ClientOptions) *cobra.Co
 				errors.CheckError(err)
 
 				if !async {
-					app, opState, err := waitOnApplicationStatus(ctx, acdClient, appQualifiedName, timeout, watchOpts{operation: true}, selectedResources, output, false)
+					app, opState, err := waitOnApplicationStatus(ctx, acdClient, appQualifiedName, timeout, watchOpts{operation: true}, selectedResources, output, len(appNames), i)
 					errors.CheckError(err)
 
 					if !dryRun {
@@ -2080,28 +2119,32 @@ func checkResourceStatus(watch watchOpts, healthStatus string, syncStatus string
 
 // resourceParentChild gets the latest state of the app and the latest state of the app's resource tree and then
 // constructs the necessary data structures to print the app as a tree.
-func resourceParentChild(ctx context.Context, acdClient argocdclient.Client, appName string, appNs string) (map[string]argoappv1.ResourceNode, map[string][]string, map[string]struct{}, map[string]*resourceState) {
+func resourceParentChild(ctx context.Context, acdClient argocdclient.Client, appName string, appNs string) (map[string]argoappv1.ResourceNode, map[string][]string, []string, map[string]*resourceState) {
 	_, appIf := acdClient.NewApplicationClientOrDie()
-	mapUidToNode, mapParentToChild, parentNode := parentChildDetails(appIf, ctx, appName, appNs)
+	mapUidToNode, mapParentToChild, topLevelUids := parentChildDetails(appIf, ctx, appName, appNs)
+	log.Trace("getting app")
 	app, err := appIf.Get(ctx, &application.ApplicationQuery{Name: pointer.String(appName), AppNamespace: pointer.String(appNs)})
 	errors.CheckError(err)
 	mapNodeNameToResourceState := make(map[string]*resourceState)
 	for _, res := range getResourceStates(app, nil) {
 		mapNodeNameToResourceState[res.Kind+"/"+res.Name] = res
 	}
-	return mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState
+	return mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState
 }
 
 const waitFormatString = "%s\t%5s\t%10s\t%10s\t%20s\t%8s\t%7s\t%10s\t%s\n"
 
 // waitOnApplicationStatus watches an application and blocks until either the desired watch conditions
 // are fulfilled or we reach the timeout. Returns the app once desired conditions have been filled.
-// Additionally return the operationState at time of fulfilment (which may be different than returned app).
-func waitOnApplicationStatus(ctx context.Context, acdClient argocdclient.Client, appName string, timeout uint, watch watchOpts, selectedResources []*argoappv1.SyncOperationResource, output string, watchFlag bool) (*argoappv1.Application, *argoappv1.OperationState, error) {
+// Additionally return the operationState at time of fulfilment (which may be different from returned app).
+//
+// totalWatching is the total number of apps being watched.
+// i is the index of the current app being watched).
+func waitOnApplicationStatus(ctx context.Context, acdClient argocdclient.Client, appName string, timeout uint, watch watchOpts, selectedResources []*argoappv1.SyncOperationResource, output string, totalWatching int, i int) (*argoappv1.Application, *argoappv1.OperationState, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// refresh controls whether or not we refresh the app before printing the final status.
+	// refresh controls whether we refresh the app before printing the final status.
 	// We only want to do this when an operation is in progress, since operations are the only
 	// time when the sync status lags behind when an operation completes
 	refresh := false
@@ -2141,28 +2184,29 @@ func waitOnApplicationStatus(ctx context.Context, acdClient argocdclient.Client,
 				_ = w.Flush()
 			}
 		case "tree":
-			mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState := resourceParentChild(ctx, acdClient, appName, appNs)
+			mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState := resourceParentChild(ctx, acdClient, appName, appNs)
 			if len(mapUidToNode) > 0 {
 				fmt.Println()
-				printTreeView(mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState)
+				printTreeView(mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState)
 			}
 		case "tree=detailed":
-			mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState := resourceParentChild(ctx, acdClient, appName, appNs)
+			mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState := resourceParentChild(ctx, acdClient, appName, appNs)
 			if len(mapUidToNode) > 0 {
 				fmt.Println()
-				printTreeViewDetailed(mapUidToNode, mapParentToChild, parentNode, mapNodeNameToResourceState)
+				printTreeViewDetailed(mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState)
 			}
 		default:
 			errors.CheckError(fmt.Errorf("unknown output format: %s", output))
 		}
 		return app
 	}
-	var resourceTreeWatchChannel chan bool
-	if watchFlag {
-		resourceTreeWatchChannel = make(chan bool)
+
+	watchTree := output == "tree" || output == "tree=detailed"
+
+	if watchTree {
 		go func() {
 			_, appIf := acdClient.NewApplicationClientOrDie()
-			resourceTreeWatch(appIf, ctx, appName, appNs, output, resourceTreeWatchChannel)
+			resourceTreeWatch(appIf, ctx, appName, appNs, watch, output, totalWatching, i)
 		}()
 	}
 
@@ -2174,7 +2218,7 @@ func waitOnApplicationStatus(ctx context.Context, acdClient argocdclient.Client,
 				AppNamespace: &appNs,
 			})
 			errors.CheckError(err)
-			if watchFlag {
+			if watchTree {
 				fmt.Print("\033[2J\033[H\033[3J")
 			}
 			fmt.Println()
@@ -2187,7 +2231,7 @@ func waitOnApplicationStatus(ctx context.Context, acdClient argocdclient.Client,
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 5, 0, 2, ' ', 0)
-	if !watchFlag {
+	if !watchTree {
 		_, _ = fmt.Fprintf(w, waitFormatString, "TIMESTAMP", "GROUP", "KIND", "NAMESPACE", "NAME", "STATUS", "HEALTH", "HOOK", "MESSAGE")
 	}
 
@@ -2249,10 +2293,6 @@ func waitOnApplicationStatus(ctx context.Context, acdClient argocdclient.Client,
 		}
 
 		if selectedResourcesAreReady && (!operationInProgress || !watch.operation) {
-			if watchFlag {
-				resourceTreeWatchChannel <- true
-				fmt.Print("\033[2J\033[H\033[3J")
-			}
 			app = printFinalStatus(app)
 			return app, finalOperationState, nil
 		}
@@ -2263,10 +2303,6 @@ func waitOnApplicationStatus(ctx context.Context, acdClient argocdclient.Client,
 			stateKey := newState.Key()
 			if prevState, found := prevStates[stateKey]; found {
 				if watch.health && prevState.Health != string(health.HealthStatusUnknown) && prevState.Health != string(health.HealthStatusDegraded) && newState.Health == string(health.HealthStatusDegraded) {
-					if watchFlag {
-						resourceTreeWatchChannel <- true
-						fmt.Print("\033[2J\033[H\033[3J")
-					}
 					_ = printFinalStatus(app)
 					return nil, finalOperationState, fmt.Errorf("application '%s' health state has transitioned from %s to %s", appName, prevState.Health, newState.Health)
 				}
@@ -2279,7 +2315,7 @@ func waitOnApplicationStatus(ctx context.Context, acdClient argocdclient.Client,
 				_, _ = fmt.Fprintf(w, waitFormatString, prevStates[stateKey].FormatItems()...)
 			}
 		}
-		if !watchFlag {
+		if !watchTree {
 			_ = w.Flush()
 		}
 	}
@@ -2301,34 +2337,23 @@ func closeGitStream(gitResourceStream application.ApplicationService_WatchClient
 	}
 }
 
-func resourceTreeWatch(appIf application.ApplicationServiceClient, ctx context.Context, appName string, appNs string, output string, done chan bool) {
-	mapUidToNode := make(map[string]argoappv1.ResourceNode)
-	mapParentToChild := make(map[string][]string)
-	parentNodes := make(map[string]struct{})
-	mapNodeNameToResourceState := make(map[string]*resourceState)
-	gitResources := make(chan v1alpha1.Application)
+// resourceParentChild gets the latest state of the app and the latest state of the app's resource tree and then
+// constructs the necessary data structures to print the app as a tree.
+//
+// totalWatching is the total number of apps being watched.
+// i is the index of the current app being watched.
+func resourceTreeWatch(appIf application.ApplicationServiceClient, ctx context.Context, appName string, appNs string, watch watchOpts, output string, totalWatching, i int) {
+	// Watch the app's resource tree.
 	appResources := make(chan []v1alpha1.ResourceNode)
-	var app *v1alpha1.Application
-	var wg sync.WaitGroup
-	wg.Add(2)
-
+	appResourceStream, err := appIf.WatchResourceTree(ctx, &application.ResourcesQuery{Name: &appName, AppNamespace: &appNs, ApplicationName: &appName})
+	if err != nil {
+		log.Fatalf("Failed to get Application tree: %v", err)
+		return
+	}
 	go func() {
-		appResourceStream, err := appIf.WatchResourceTree(ctx, &application.ResourcesQuery{Name: &appName, AppNamespace: &appNs, ApplicationName: &appName})
-		if err != nil {
-			log.Printf("Failed to get Application tree: %v", err)
-			done <- true
-			wg.Done()
-			return
-		}
 		for {
 			select {
 			case <-ctx.Done():
-				closeAppStream(appResourceStream)
-				wg.Done()
-				return
-			case <-done:
-				closeAppStream(appResourceStream)
-				wg.Done()
 				return
 			default:
 				msg, err := appResourceStream.Recv()
@@ -2345,22 +2370,16 @@ func resourceTreeWatch(appIf application.ApplicationServiceClient, ctx context.C
 		}
 	}()
 
+	// Watch the app.
+	gitResources := make(chan v1alpha1.Application)
+	gitResourceStream, err := appIf.Watch(ctx, &application.ApplicationQuery{Name: &appName, AppNamespace: &appNs})
+	if err != nil {
+		log.Fatalf("failed to get git resources: %v", err)
+	}
 	go func() {
-		gitResourceStream, err := appIf.Watch(ctx, &application.ApplicationQuery{Name: &appName, AppNamespace: &appNs})
-		if err != nil {
-			done <- true
-			wg.Done()
-			log.Fatalf("failed to get git resources: %v", err)
-		}
 		for {
 			select {
 			case <-ctx.Done():
-				closeGitStream(gitResourceStream)
-				wg.Done()
-				return
-			case <-done:
-				closeGitStream(gitResourceStream)
-				wg.Done()
 				return
 			default:
 				msg, err := gitResourceStream.Recv()
@@ -2375,42 +2394,56 @@ func resourceTreeWatch(appIf application.ApplicationServiceClient, ctx context.C
 			}
 		}
 	}()
-	var once sync.Once
+
+	// These hold the state of the app and git resources.
+	mapUidToNode := make(map[string]argoappv1.ResourceNode)
+	mapParentToChild := make(map[string][]string)
+	parentNodes := make([]string, 0)
+	mapNodeNameToResourceState := make(map[string]*resourceState)
+
+	// Load the initial state.
+	app, err := appIf.Get(ctx, &application.ApplicationQuery{Name: &appName, AppNamespace: &appNs})
+	errors.CheckError(err)
+	resourceTree, err := appIf.ResourceTree(ctx, &application.ResourcesQuery{Name: &appName, AppNamespace: &appNs, ApplicationName: &appName})
+	errors.CheckError(err)
+	for _, res := range getResourceStates(app, nil) {
+		mapNodeNameToResourceState[res.Kind+"/"+res.Name] = res
+	}
+	mapUidToNode, mapParentToChild, parentNodes = parentChildInfo(resourceTree.Nodes)
+	printAppResourceStatus(mapUidToNode, mapParentToChild, parentNodes, mapNodeNameToResourceState, watch, output, app, totalWatching, i)
 
 	for {
 		select {
 		case <-ctx.Done():
-			once.Do(func() {
-				close(gitResources)
-				close(appResources)
-				close(done)
-				fmt.Println("closed all the resources from ctx cancellation")
-			})
+			closeAppStream(appResourceStream)
+			closeGitStream(gitResourceStream)
 			return
 		case appTreeNodes := <-appResources:
 			mapUidToNode, mapParentToChild, parentNodes = parentChildInfo(appTreeNodes)
-			printAppResourceStatus(mapUidToNode, mapParentToChild, parentNodes, mapNodeNameToResourceState, output, app)
+			printAppResourceStatus(mapUidToNode, mapParentToChild, parentNodes, mapNodeNameToResourceState, watch, output, app, totalWatching, i)
 		case gitResourceApp := <-gitResources:
 			app = &gitResourceApp
+			// Empty the map to avoid stale data.
+			mapNodeNameToResourceState = make(map[string]*resourceState)
 			for _, res := range getResourceStates(&gitResourceApp, nil) {
 				mapNodeNameToResourceState[res.Kind+"/"+res.Name] = res
 			}
-			printAppResourceStatus(mapUidToNode, mapParentToChild, parentNodes, mapNodeNameToResourceState, output, app)
-		case <-done:
-			wg.Wait()
-			once.Do(func() {
-				close(gitResources)
-				close(appResources)
-				close(done)
-				fmt.Println("closed all the resources from done cancellation")
-			})
-			return
+			printAppResourceStatus(mapUidToNode, mapParentToChild, parentNodes, mapNodeNameToResourceState, watch, output, app, totalWatching, i)
 		}
 	}
 }
 
-func printAppResourceStatus(mapUidToNode map[string]v1alpha1.ResourceNode, mapParentToChild map[string][]string, parentNodes map[string]struct{}, mapNodeNameToResourceState map[string]*resourceState, output string, app *v1alpha1.Application) {
+func printAppResourceStatus(mapUidToNode map[string]v1alpha1.ResourceNode, mapParentToChild map[string][]string, topLevelUids []string, mapNodeNameToResourceState map[string]*resourceState, watch watchOpts, output string, app *v1alpha1.Application, totalWatching, i int) {
+	// Clear screen.
 	fmt.Print("\033[2J\033[H\033[3J")
+
+	fmt.Printf("Watching app %s", app.QualifiedName())
+	if totalWatching > 1 {
+		fmt.Printf(" (%d/%d)\n", i+1, totalWatching)
+	}
+	fmt.Println()
+	fmt.Println(watch.Description())
+
 	switch output {
 	case "yaml", "json":
 		err := PrintResource(app, output)
@@ -2425,12 +2458,12 @@ func printAppResourceStatus(mapUidToNode map[string]v1alpha1.ResourceNode, mapPa
 	case "tree":
 		if len(mapUidToNode) > 0 {
 			fmt.Println()
-			printTreeView(mapUidToNode, mapParentToChild, parentNodes, mapNodeNameToResourceState)
+			printTreeView(mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState)
 		}
 	case "tree=detailed":
 		if len(mapUidToNode) > 0 {
 			fmt.Println()
-			printTreeViewDetailed(mapUidToNode, mapParentToChild, parentNodes, mapNodeNameToResourceState)
+			printTreeViewDetailed(mapUidToNode, mapParentToChild, topLevelUids, mapNodeNameToResourceState)
 		}
 	default:
 		errors.CheckError(fmt.Errorf("unknown output format: %s", output))
@@ -2592,7 +2625,7 @@ func NewApplicationRollbackCommand(clientOpts *argocdclient.ClientOptions) *cobr
 
 			_, _, err = waitOnApplicationStatus(ctx, acdClient, app.QualifiedName(), timeout, watchOpts{
 				operation: true,
-			}, nil, output, false)
+			}, nil, output, 1, 0)
 			errors.CheckError(err)
 		},
 	}

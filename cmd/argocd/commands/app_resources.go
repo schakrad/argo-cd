@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 	"os"
+	"text/tabwriter"
 
 	"github.com/argoproj/argo-cd/v2/cmd/util"
 	"github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
@@ -18,8 +19,6 @@ import (
 	"github.com/argoproj/argo-cd/v2/util/argo"
 	"github.com/argoproj/argo-cd/v2/util/errors"
 	argoio "github.com/argoproj/argo-cd/v2/util/io"
-
-	"text/tabwriter"
 )
 
 func NewApplicationPatchResourceCommand(clientOpts *argocdclient.ClientOptions) *cobra.Command {
@@ -148,10 +147,10 @@ func NewApplicationDeleteResourceCommand(clientOpts *argocdclient.ClientOptions)
 	return command
 }
 
-func parentChildInfo(nodes []v1alpha1.ResourceNode) (map[string]v1alpha1.ResourceNode, map[string][]string, map[string]struct{}) {
+func parentChildInfo(nodes []v1alpha1.ResourceNode) (map[string]v1alpha1.ResourceNode, map[string][]string, []string) {
 	mapUidToNode := make(map[string]v1alpha1.ResourceNode)
 	mapParentToChild := make(map[string][]string)
-	parentNode := make(map[string]struct{})
+	topLevelUids := make([]string, 0)
 
 	for _, node := range nodes {
 		mapUidToNode[node.UID] = node
@@ -164,34 +163,34 @@ func parentChildInfo(nodes []v1alpha1.ResourceNode) (map[string]v1alpha1.Resourc
 			}
 			mapParentToChild[node.ParentRefs[0].UID] = append(mapParentToChild[node.ParentRefs[0].UID], node.UID)
 		} else {
-			parentNode[node.UID] = struct{}{}
+			topLevelUids = append(topLevelUids, node.UID)
 		}
 	}
-	return mapUidToNode, mapParentToChild, parentNode
+	return mapUidToNode, mapParentToChild, topLevelUids
 }
 
-func printDetailedTreeViewAppResourcesNotOrphaned(nodeMapping map[string]v1alpha1.ResourceNode, parentChildMapping map[string][]string, parentNodes map[string]struct{}, orphaned bool, listAll bool, w *tabwriter.Writer) {
-	for uid := range parentNodes {
+func printDetailedTreeViewAppResourcesNotOrphaned(nodeMapping map[string]v1alpha1.ResourceNode, parentChildMapping map[string][]string, topLevelUids []string, orphaned bool, listAll bool, w *tabwriter.Writer) {
+	for _, uid := range topLevelUids {
 		detailedTreeViewAppResourcesNotOrphaned("", nodeMapping, parentChildMapping, nodeMapping[uid], w)
 	}
 
 }
 
-func printDetailedTreeViewAppResourcesOrphaned(nodeMapping map[string]v1alpha1.ResourceNode, parentChildMapping map[string][]string, parentNodes map[string]struct{}, orphaned bool, listAll bool, w *tabwriter.Writer) {
-	for uid := range parentNodes {
+func printDetailedTreeViewAppResourcesOrphaned(nodeMapping map[string]v1alpha1.ResourceNode, parentChildMapping map[string][]string, topLevelUids []string, orphaned bool, listAll bool, w *tabwriter.Writer) {
+	for _, uid := range topLevelUids {
 		detailedTreeViewAppResourcesOrphaned("", nodeMapping, parentChildMapping, nodeMapping[uid], w)
 	}
 }
 
-func printTreeViewAppResourcesNotOrphaned(nodeMapping map[string]v1alpha1.ResourceNode, parentChildMapping map[string][]string, parentNodes map[string]struct{}, orphaned bool, listAll bool, w *tabwriter.Writer) {
-	for uid := range parentNodes {
+func printTreeViewAppResourcesNotOrphaned(nodeMapping map[string]v1alpha1.ResourceNode, parentChildMapping map[string][]string, topLevelUids []string, orphaned bool, listAll bool, w *tabwriter.Writer) {
+	for _, uid := range topLevelUids {
 		treeViewAppResourcesNotOrphaned("", nodeMapping, parentChildMapping, nodeMapping[uid], w)
 	}
 
 }
 
-func printTreeViewAppResourcesOrphaned(nodeMapping map[string]v1alpha1.ResourceNode, parentChildMapping map[string][]string, parentNodes map[string]struct{}, orphaned bool, listAll bool, w *tabwriter.Writer) {
-	for uid := range parentNodes {
+func printTreeViewAppResourcesOrphaned(nodeMapping map[string]v1alpha1.ResourceNode, parentChildMapping map[string][]string, topLevelUids []string, orphaned bool, listAll bool, w *tabwriter.Writer) {
+	for _, uid := range topLevelUids {
 		treeViewAppResourcesOrphaned("", nodeMapping, parentChildMapping, nodeMapping[uid], w)
 	}
 }
